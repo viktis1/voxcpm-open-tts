@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -26,6 +27,61 @@ if _voxcpm_root:
 
 def _drop_none(values: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in values.items() if v is not None}
+
+
+@contextlib.contextmanager
+def _prefer_cuda_weight_loading(device: str):
+    """Load VoxCPM checkpoint tensors on CUDA directly when supported."""
+    if not device.startswith("cuda"):
+        yield
+        return
+
+    try:
+        import voxcpm.model.voxcpm as voxcpm_v1
+        import voxcpm.model.voxcpm2 as voxcpm_v2
+        from safetensors.torch import load_file as safetensors_load_file
+    except Exception:
+        yield
+        return
+
+    patched = []
+
+    def _patch_module(module):
+        original_load_file = getattr(module, "load_file", None)
+        if original_load_file is not None:
+            patched.append((module, "load_file", original_load_file))
+
+            def _load_file(path, *args, **kwargs):
+                if "device" not in kwargs:
+                    kwargs["device"] = device
+                return safetensors_load_file(path, *args, **kwargs)
+
+            module.load_file = _load_file
+
+        torch_mod = getattr(module, "torch", None)
+        original_torch_load = getattr(torch_mod, "load", None) if torch_mod else None
+        if original_torch_load is not None:
+            patched.append((torch_mod, "load", original_torch_load))
+
+            def _torch_load(f, *args, **kwargs):
+                filename = str(f)
+                if (
+                    kwargs.get("map_location") == "cpu"
+                    and os.path.basename(filename) == "pytorch_model.bin"
+                ):
+                    kwargs["map_location"] = device
+                return original_torch_load(f, *args, **kwargs)
+
+            torch_mod.load = _torch_load
+
+    _patch_module(voxcpm_v1)
+    _patch_module(voxcpm_v2)
+
+    try:
+        yield
+    finally:
+        for owner, attr, original in reversed(patched):
+            setattr(owner, attr, original)
 
 
 class TTSEngine:
@@ -95,15 +151,16 @@ class TTSEngine:
     def _load_model(self):
         from voxcpm import VoxCPM
 
-        return VoxCPM.from_pretrained(
-            hf_model_id=self._settings.voxcpm_model,
-            load_denoiser=self._settings.voxcpm_load_denoiser,
-            zipenhancer_model_id=self._settings.voxcpm_zipenhancer_model,
-            cache_dir=None,
-            local_files_only=self._settings.voxcpm_local_files_only,
-            optimize=self._optimize,
-            device=None if self._settings.voxcpm_device == "auto" else self._device,
-        )
+        with _prefer_cuda_weight_loading(self._device):
+            return VoxCPM.from_pretrained(
+                hf_model_id=self._settings.voxcpm_model,
+                load_denoiser=self._settings.voxcpm_load_denoiser,
+                zipenhancer_model_id=self._settings.voxcpm_zipenhancer_model,
+                cache_dir=None,
+                local_files_only=self._settings.voxcpm_local_files_only,
+                optimize=self._optimize,
+                device=None if self._settings.voxcpm_device == "auto" else self._device,
+            )
 
     def _detect_v2(self) -> bool:
         try:
